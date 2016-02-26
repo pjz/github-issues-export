@@ -8,7 +8,7 @@
 # written permission.
 # This software is provided by Matěj Cepl "AS IS" and without any
 # express or implied warranties.
-import argparse
+
 import datetime
 import getpass
 import logging
@@ -18,6 +18,7 @@ from xml.etree import ElementTree as et
 
 import dateutil.parser
 
+import click
 import requests
 from requests.auth import HTTPBasicAuth
 
@@ -49,61 +50,14 @@ def _xml_indent(elem, level=0):
             elem.tail = i
 
 
-def get_configuration():
-    config = {}
-    conf_pars = SafeConfigParser({
-        'user': getpass.getuser(),
-        'password': ''
-    })
-    conf_pars.read(os.path.expanduser("~/.githubrc"))
-    config['git_user'] = conf_pars.get('github', 'user')
-    config['git_password'] = conf_pars.get('github', 'password')
-
-    desc = """Export issues from a Github Issue Tracker.
-           The result is file which can be imported into Bugzilla
-           with importxml.pl."""
-    parser = argparse.ArgumentParser(description=desc)
-    parser.add_argument("-u", "--github_user", metavar="USER",
-                        action="store", dest="github_user", default=None,
-                        help="GitHub user name")
-    parser.add_argument("-w", "--github_password", metavar="PASSW",
-                        action="store", dest="github_password", default=None,
-                        help="GitHub password")
-    parser.add_argument("-b", "--be", required=False,
-                        action="store_true", dest="bugseverywhere",
-                        default=False,
-                        help="Whether to generate BE compliant output")
-    parser.add_argument("-p", "--product", required=False,
-                        action="store", dest="bz_product", default=None,
-                        help="Bugzilla product name")
-    parser.add_argument("-c", "--component", required=False,
-                        action="store", dest="bz_component", default=None,
-                        help="Bugzilla user name")
-    parser.add_argument("repo",
-                        help="name of the github repo (owner/repo_name)")
-    options = parser.parse_args()
-
-    if options.github_user:
-        config['git_user'] = options.github_user
-    if options.github_password:
-        config['git_password'] = options.github_password
-
-    config['repo'] = options.repo
-    config['bz_product'] = options.bz_product
-    config['bz_component'] = options.bz_component
-    config['be'] = options.bugseverywhere
-
-    return config
-
-
 def add_subelement(bug, iss, iss_attr, trg_elem, convert=None):
-    if (iss_attr in iss) and (iss[iss_attr] is not None):
-        if convert:
-            value = convert(iss[iss_attr])
-        else:
-            value = iss[iss_attr]
-        logging.debug("iss_attr = %s, value = %s", iss_attr, value)
-        et.SubElement(bug, trg_elem).text = value
+    value = iss.get(iss_attr)
+    if value is None:
+        return
+    if convert:
+        value = convert(value)
+    logging.debug("iss_attr = %s, value = %s", iss_attr, value)
+    et.SubElement(bug, trg_elem).text = value
 
 
 def make_bz_comment(body, who, when):
@@ -160,7 +114,7 @@ def file_bugeverywhere_issue(cnf, iss, creds):
     add_subelement(bug, iss, u"state", "status")
     add_subelement(bug, iss, u"assignee", "assigned")
 
-    if (u'user' in iss) and (iss[u'user'] is not None):
+    if iss.get(u'user') is not None:
         new_elem = et.Element("reporter")
         user_login = iss[u"user"][u"login"]
         new_elem.text = user_login
@@ -278,46 +232,82 @@ def get_issues(repo, state, creds):
     return res.json()
 
 
-def main(conf):
-    """
-    Export your open github issues into a csv format for
-    pivotal tracker import
-    """
-    credentials = None
-    if conf['git_password'] != '':
-        credentials = (conf['git_user'], conf['git_password'])
+def load_config():
+    conf_pars = SafeConfigParser({
+        'user': getpass.getuser(),
+        'password': ''
+    })
+    conf_pars.read(os.path.expanduser("~/.githubrc"))
+    return conf_pars.get('github', 'user'), conf_pars.get('github', 'password')
 
-    if conf['be']:
-        out_xml = et.fromstring("""<be-xml>
+
+@click.group()
+@click.option('-u', '--github_user', help="GitHub user", required=False)
+@click.option('-w', '--github_password', help="GitHub password", required=False)
+@click.pass_context
+def main(context, github_user, github_password):
+    """
+    github_issues_export
+    """
+    if None in (github_user, github_password):
+        rc_user, rc_password = load_config()
+        github_user = github_user or rc_user
+        github_password = github_password or rc_password
+
+    context.obj['credentials'] = (github_user, github_password)
+
+
+@main.command()
+@click.argument('repo')
+def be(context, repo):
+    """
+    Export in BugsEverywhere format
+    """
+    conf = context.obj
+    out_xml = et.fromstring("""<be-xml>
             <version>
                 <tag>bf52e18a</tag>
                 <committer>W. Trevor King</committer>
                 <date>2011-05-25</date>
                 <revision>bf52e18aad6e0e8effcadc6b90dfedf4d15b1859</revision>
             </version>
-        </be-xml>""")
-    else:
-        out_xml = et.Element("bugzilla", attrib={
-            'version': '3.4.14',
-            'urlbase': 'http://github.com',
-            'maintainer': 'mcepl@cepl.eu',
-            'exporter': '%s@github.com' % conf['git_user']
-        })
+    </be-xml>""")
+    conf.update({ 'repo' : repo })
+    file_bugs(conf, out_xml, file_bugeverywhere_issue)
 
+
+@main.command()
+@click.argument('repo')
+@click.option('-p', '--product', help="Bugzilla product name")
+@click.option('-c', '--component', help="Bugzilla component name")
+@click.pass_context
+def bugzilla(repo, product, component, context):
+    """
+    Export in Bugzilla format
+    """
+    conf = context.obj
+    out_xml = et.Element("bugzilla", attrib={
+        'version': '3.4.14',
+        'urlbase': 'http://github.com',
+        'maintainer': 'mcepl@cepl.eu',
+        'exporter': '%s@github.com' % conf['credentials'][0]
+    })
+    conf.update({ 'repo' : repo })
+    file_bugs(conf, out_xml, file_bugzilla_issue)
+    logging.info(CLOSING_MESSAGE)
+
+
+def file_bugs(conf, out_xml, filer):
+
+    credentials = conf['credentials']
     for state in ('open', 'closed'):
         for issue in get_issues(conf['repo'], state, credentials):
-            if conf['be']:
-                subelement_xml = file_bugeverywhere_issue(conf, issue, credentials)
-            else:
-                subelement_xml = file_bugzilla_issue(conf, issue, credentials)
+            subelement_xml = filer(conf, issue, credentials)
             out_xml.append(subelement_xml)
 
     _xml_indent(out_xml)
-    print et.tostring(out_xml, "utf-8")
+    print(et.tostring(out_xml, "utf-8"))
 
-    if not conf['be']:
-        logging.info(CLOSING_MESSAGE)
 
 if __name__ == '__main__':
-    cfg = get_configuration()
-    main(cfg)
+    main(obj={})
