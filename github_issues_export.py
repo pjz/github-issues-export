@@ -11,19 +11,18 @@
 import argparse
 import datetime
 import getpass
-import json
 import logging
 import os.path
-import urllib2
 from ConfigParser import SafeConfigParser
 from xml.etree import ElementTree as et
 
 import dateutil.parser
-from urllib2_prior_auth import HTTPBasicPriorAuthHandler
 
+import requests
+from requests.auth import HTTPBasicAuth
 
 logging.basicConfig(format='%(levelname)s:%(funcName)s:%(message)s',
-                    level=logging.INFO)
+                    level=logging.DEBUG)
 
 BASE_URL = 'https://api.github.com'
 CLOSING_MESSAGE = """It is necessary to fix all email addresses
@@ -153,7 +152,7 @@ def format_be_time(in_time):
     return out
 
 
-def file_bugeverywhere_issue(cnf, iss):
+def file_bugeverywhere_issue(cnf, iss, creds):
     bug = et.Element("bug")
 
     add_subelement(bug, iss, u"created_at", "created", format_be_time)
@@ -175,7 +174,7 @@ def file_bugeverywhere_issue(cnf, iss):
                                    iss[u"user"][u"login"],
                                    format_be_time(iss[u"created_at"])))
 
-    for comment in get_comments(cnf['repo'], iss[u"number"]):
+    for comment in get_comments(cnf['repo'], iss[u"number"], creds):
         bug.append(make_be_comment(comment[u"body"],
                    comment[u"user"][u"login"],
                    format_be_time(comment[u"updated_at"])))
@@ -183,7 +182,7 @@ def file_bugeverywhere_issue(cnf, iss):
     return bug
 
 
-def file_bugzilla_issue(cnf, iss):
+def file_bugzilla_issue(cnf, iss, creds):
     """
     Generate XML artifact with the issue
 
@@ -232,7 +231,7 @@ def file_bugzilla_issue(cnf, iss):
 
     issue_xml.append(make_bz_comment(iss[u"body"], iss[u"user"][u"login"],
                                      created_at))
-    for comment in get_comments(cnf['repo'], iss[u"number"]):
+    for comment in get_comments(cnf['repo'], iss[u"number"], creds):
         issue_xml.append(make_bz_comment(
             comment[u"body"], comment[u"user"][u"login"],
             format_bz_time(comment[u"updated_at"])))
@@ -249,25 +248,21 @@ def file_bugzilla_issue(cnf, iss):
     return issue_xml
 
 
-def get_req(url):
+def get_url(url, credentials):
     logging.debug('url = {0}'.format(url))
-    req = urllib2.Request(url)
-    req.add_header('Accept', 'application/vnd.github.v3+json')
-    return req
+    kwargs = { 'headers': { 'Accept': 'application/vnd.github.v3+json' } }
+    if credentials:
+        kwargs.update( { 'auth': HTTPBasicAuth(*credentials) })
+    return requests.get(url, **kwargs)
+
+def get_comments(repo, isno, creds):
+    url = "{0}/repos/{1}/issues/{2}/comments".format(BASE_URL, repo, isno)
+    res = get_url(url, creds)
+    res.raise_for_status()
+    return res.json()
 
 
-def get_comments(repo, isno):
-    req = get_req("{0}/repos/{1}/issues/{2}/comments".format(BASE_URL,
-                                                             repo, isno))
-
-    res = urllib2.urlopen(req)
-    if res.getcode() == 200:
-        return json.loads(res.read())
-
-    raise IOError("GitHub issue list inaccessible")
-
-
-def get_issues(repo, state):
+def get_issues(repo, state, creds):
     """
     Get a list of issues for the particular repo from GitHub and return list.
 
@@ -277,14 +272,10 @@ def get_issues(repo, state):
     @param state either "open" or "closed"
     @return list of dicts with issues
     """
-    req = get_req("{0}/repos/{1}/issues?state={2}".format(BASE_URL,
-                                                          repo, state))
-    res = urllib2.urlopen(req)
-
-    if res.getcode() == 200:
-        return json.loads(res.read())
-
-    raise IOError("GitHub issue list inaccessible")
+    url = "{0}/repos/{1}/issues?state={2}".format(BASE_URL, repo, state)
+    res = get_url(url, creds)
+    res.raise_for_status()
+    return res.json()
 
 
 def main(conf):
@@ -292,17 +283,9 @@ def main(conf):
     Export your open github issues into a csv format for
     pivotal tracker import
     """
+    credentials = None
     if conf['git_password'] != '':
-        pwd_manager = urllib2.HTTPPasswordMgrWithDefaultRealm()
-        pwd_manager.add_password(None, 'https://api.github.com',
-                                 conf['git_user'], conf['git_password'])
-        auth_prior_handler = HTTPBasicPriorAuthHandler(pwd_manager)
-        verbose_handler = urllib2.HTTPSHandler(1)
-
-        opener = urllib2.build_opener(auth_prior_handler,
-                                      urllib2.HTTPRedirectHandler)
-        opener.add_handler(verbose_handler)
-        urllib2.install_opener(opener)
+        credentials = (conf['git_user'], conf['git_password'])
 
     if conf['be']:
         out_xml = et.fromstring("""<be-xml>
@@ -322,11 +305,11 @@ def main(conf):
         })
 
     for state in ('open', 'closed'):
-        for issue in get_issues(conf['repo'], state=state):
+        for issue in get_issues(conf['repo'], state, credentials):
             if conf['be']:
-                subelement_xml = file_bugeverywhere_issue(conf, issue)
+                subelement_xml = file_bugeverywhere_issue(conf, issue, credentials)
             else:
-                subelement_xml = file_bugzilla_issue(conf, issue)
+                subelement_xml = file_bugzilla_issue(conf, issue, credentials)
             out_xml.append(subelement_xml)
 
     _xml_indent(out_xml)
